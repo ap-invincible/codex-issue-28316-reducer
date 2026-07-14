@@ -72,19 +72,24 @@ flowchart LR
     E -->|Yes| G[Read JSON body<br/>max 64 MiB]
     G -->|Malformed or too large| H[400 or 413<br/>never forwarded]
     G -->|Valid JSON| I[Find newest role=user message]
-    I --> J[Walk nested input/content/tool values]
-    J --> K{Image data URL?}
-    K -->|No| L[Retain value exactly]
-    K -->|Yes| M{Current user item?}
-    M -->|Yes| N[Preserve bytes<br/>remember SHA-256]
-    M -->|No, unseen hash| O[Preserve once<br/>remember SHA-256]
-    M -->|No, known hash| P[Replace with input_text marker]
-    N --> Q[Re-serialize JSON]
-    O --> Q
-    P --> Q
-    L --> Q
-    Q --> R[Forward to upstream /v1/responses]
-    R --> S[Pipe status, headers, and SSE bytes back to Codex]
+    I --> J{Visual memory or auto reinspection?}
+    J -->|Yes| K[Create missing image summaries]
+    K --> L{Auto reinspection and historical summaries?}
+    L -->|Yes| M[Ask model which hashes need original pixels]
+    L -->|No| N[Walk nested input/content/tool values]
+    M --> N
+    J -->|No| N
+    N --> O{Image data URL?}
+    O -->|No| P[Retain value exactly]
+    O -->|Yes, selected for reinspection| Q[Restore encrypted cached image]
+    O -->|Yes, current user item| R[Preserve bytes]
+    O -->|Yes, historical image| S[Replace with marker or visual memory]
+    P --> T[Re-serialize JSON]
+    Q --> T
+    R --> T
+    S --> T
+    T --> U[Forward to upstream /v1/responses]
+    U --> V[Pipe status, headers, and SSE bytes back to Codex]
 ```
 
 ## Lifecycle and state model
@@ -103,17 +108,21 @@ Use `--session-image-cache` to additionally retain up to 64 recent original imag
 stateDiagram-v2
     [*] --> NewProcess
     NewProcess --> FirstRequest: start reducer
-    FirstRequest --> CurrentImageSeen: image in newest user message
-    FirstRequest --> HistoricalImageSeen: image outside newest user message
-    CurrentImageSeen --> Cached: preserve and record hash
-    HistoricalImageSeen --> Cached: preserve first occurrence and record hash
-    Cached --> ReplayedHistory: same hash appears later outside current user message
-    ReplayedHistory --> Marker: replace content item with input_text
-    Cached --> ExplicitReupload: same image attached in newest user message
-    ExplicitReupload --> Cached: preserve and refresh LRU position
-    Cached --> Evicted: LRU capacity exceeded
-    Evicted --> HistoricalImageSeen: same bytes appear after eviction
-    Marker --> [*]: request continues upstream
+    FirstRequest --> ImageSeen: data image found
+    ImageSeen --> MetadataCached: hash and metadata remembered
+    ImageSeen --> SummaryCached: visual memory mode generates summary
+    ImageSeen --> EncryptedCached: session cache or auto mode encrypts image in RAM
+    MetadataCached --> HistoricalReplay: same hash outside newest user message
+    SummaryCached --> HistoricalReplay
+    EncryptedCached --> HistoricalReplay
+    HistoricalReplay --> Marker: reducer-only mode
+    HistoricalReplay --> VisualMemory: summary mode
+    VisualMemory --> ReinspectionDecision: auto mode
+    ReinspectionDecision --> VisualMemory: no hash selected or decision fails
+    ReinspectionDecision --> RestoredImage: selected hash is cached
+    RestoredImage --> [*]: normal request continues upstream
+    Marker --> [*]: normal request continues upstream
+    VisualMemory --> [*]: normal request continues upstream
 ```
 
 ### Preservation rule
@@ -144,7 +153,7 @@ Start with `--visual-memory=summary` to preserve useful visual knowledge when hi
 node .\bin\image-reducer.mjs start `
   --listen 127.0.0.1:8787 `
   --upstream https://api.openai.com/v1 `
-  --auto-reinspect
+  --visual-memory=summary
 ```
 
 For each image hash without a cached summary, the reducer makes one additional non-stored Responses request while the original image is available. The request asks the vision model to record readable text, numbers, layout, objects, relationships, controls, and uncertainty in at most 1,200 output tokens. The original image is still forwarded on the current turn. Later historical copies become an `input_text` item containing the hash metadata and that summary.
@@ -153,7 +162,16 @@ The summary is held in the process-local LRU and is never written to disk by def
 
 ### Automatic reinspection
 
-`--auto-reinspect` enables visual-memory summaries and the encrypted session image cache automatically. When a later request contains a historical visual-memory item, the reducer makes one small non-streamed decision request containing the latest user text and the available summaries. If the model selects a hash because the summary lacks the needed detail, the reducer decrypts only that cached image and restores it in the normal upstream request. The normal request, including SSE streaming, is then passed through unchanged.
+`--auto-reinspect` enables visual-memory summaries and the encrypted session image cache automatically:
+
+```powershell
+node .\bin\image-reducer.mjs start `
+  --listen 127.0.0.1:8787 `
+  --upstream https://api.openai.com/v1 `
+  --auto-reinspect
+```
+
+When a later request contains a historical visual-memory item, the reducer makes one small non-streamed decision request containing the latest user text and the available summaries. If the model selects a hash because the summary lacks the needed detail, the reducer decrypts only that cached image and restores it in the normal upstream request. The normal request, including SSE streaming, is then passed through unchanged.
 
 This is intentionally conservative: the decision request may select no image, may select more than one image, and falls back to text-only visual memory if it fails or returns invalid JSON. It adds one provider request only when the current request contains a historical image with a summary. The reducer never writes the raw image or encryption key to disk.
 
@@ -180,7 +198,7 @@ Not recognized or changed:
 - Non-image tool output
 - Text, tool IDs, ordering, and unrelated JSON fields
 
-The marker includes enough metadata for diagnostics without retaining the source bytes:
+The marker includes enough metadata for diagnostics without placing source bytes in the forwarded request. In default mode the reducer does not retain those bytes; the optional session cache retains encrypted bytes only in process memory:
 
 ```text
 [image omitted from history;
@@ -216,6 +234,8 @@ sequenceDiagram
 
 The reducer does not authenticate with the provider itself. It forwards the incoming `Authorization` header, so the API key remains owned by Codex’s process environment.
 
+Visual-memory summary and reinspection-decision requests are separate, non-streamed Responses requests made directly to the configured upstream with the same `Authorization` header. The final user-facing request retains its original streaming behavior.
+
 ## Bootstrap mode
 
 Use `--bootstrap=strip-history` when starting against a session that already contains historical images. On the first intercepted Responses request, image content outside the newest user message is reduced immediately, even if its hash is not yet in the fresh process cache.
@@ -248,10 +268,12 @@ Metric meanings:
 |---|---|
 | `request` | Sequential request number for this reducer process |
 | `images_passed` | Image payloads forwarded unchanged in this request |
-| `images_replaced` | Historical image items converted to text markers |
+| `images_replaced` | Historical image items converted to markers or visual-memory text |
 | `bytes_removed` | Original image data-URL string bytes removed |
 | `request_bytes` | Serialized JSON size before and after transformation |
 | `estimated_tokens_saved` | Rough estimate using `bytes_removed / 4`; not provider billing telemetry |
+
+Summary and reinspection-decision calls are intentionally excluded from these per-request forwarding metrics. In automatic mode, `images_passed` can be nonzero on a historical follow-up because the reducer selected and restored a cached image.
 
 Variable names are emitted in green ANSI text; separators and values remain white. If output is redirected to a non-color-aware sink, the underlying metric text is unchanged apart from ANSI escape sequences.
 
@@ -262,8 +284,16 @@ Start the proxy from the project root:
 ```powershell
 node .\bin\image-reducer.mjs start `
   --listen 127.0.0.1:8787 `
-  --upstream https://api.openai.com/v1
+  --upstream https://api.openai.com/v1 `
+  --auto-reinspect
 ```
+
+| Flag | Effect |
+|---|---|
+| No optional flag | Replace repeated historical images with a small marker. |
+| `--visual-memory=summary` | Generate and retain text summaries for historical replacements. |
+| `--session-image-cache` | Retain up to 64 recent images encrypted in process memory; no automatic resend. |
+| `--auto-reinspect` | Enable summaries, encrypted session cache, and model-selected automatic image restore. |
 
 Configure a Codex profile at `%USERPROFILE%\.codex\image-reducer.config.toml`:
 
@@ -297,6 +327,9 @@ Environment variables are process-scoped; setting a variable in one terminal or 
 | Compressed Responses request | Return `415` | No |
 | Malformed JSON | Return `400` | No |
 | Body larger than 64 MiB | Return `413` | No |
+| Visual-memory summary request fails | Forward current image; use marker for later history | Yes, main request |
+| Reinspection decision fails or is invalid | Send visual-memory text only | Yes, main request |
+| Selected image is not in the session cache | Preserve the image already present in the incoming request, if available | Yes |
 | Upstream connection failure | Return `502` or destroy an already-streaming response | Attempted |
 | Non-Responses request | Transparent forward | Yes |
 
@@ -320,9 +353,12 @@ The test suite verifies:
 4. Explicit re-uploads remain images.
 5. Ordinary base64, PDFs, and remote URLs are unchanged.
 6. Bootstrap mode strips historical image data.
-7. `/responses` routing reaches the upstream.
-8. Streaming responses pass through unchanged.
-9. Compressed and malformed requests are rejected locally.
+7. Session-cache ciphertext can be restored and is cleared on shutdown.
+8. Session caching does not change normal historical reduction.
+9. Visual-memory summaries replace historical image payloads.
+10. Automatic reinspection restores only the model-selected cached image.
+11. `/responses` routing reaches the upstream and streaming responses pass through unchanged.
+12. Compressed and malformed requests are rejected locally.
 
 ### Manual Codex test
 
@@ -333,7 +369,8 @@ Terminal 1:
 ```powershell
 node .\bin\image-reducer.mjs start `
   --listen 127.0.0.1:8787 `
-  --upstream https://api.openai.com/v1
+  --upstream https://api.openai.com/v1 `
+  --auto-reinspect
 ```
 
 Terminal 2:
@@ -343,7 +380,7 @@ $env:OPENAI_API_KEY = "sk-your-key"
 codex --profile image-reducer
 ```
 
-Attach an image and ask Codex to inspect it. Then send a text-only follow-up such as `Inspect it again pls`. The first terminal should show an initial `images_passed` count and a later `images_replaced` count with a smaller `request_bytes` result.
+Attach an image and ask Codex to inspect it. Then send a text-only follow-up that requests a detail omitted from the summary, such as `What is the tiny status label in the top-right?`. The first terminal should show an initial `images_passed` count. The follow-up can show `images_passed=1` when automatic reinspection restores the selected image, or `images_replaced=1` when the summary alone is sufficient.
 
 ## Deliberate scope
 
