@@ -1,0 +1,16 @@
+{
+  "name": "codex-image-replay-reducer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Responses API proxy that removes replayed base64 image history from Codex CLI requests.",
+  "type": "module",
+  "bin": {
+    "image-reducer": "bin/image-reducer.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Image Replay Reducer"
+  short_description: "Run and verify the Codex image replay proxy."
+  default_prompt: "Set up or verify the Codex CLI image replay reducer for this provider."
