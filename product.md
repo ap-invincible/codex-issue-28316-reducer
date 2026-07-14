@@ -6,7 +6,7 @@ The Image Replay Reducer is a local, zero-runtime-dependency HTTP proxy for Code
 
 It targets OpenAI Codex issue [#28316](https://github.com/openai/codex/issues/28316): an uploaded image is correctly sent once, but its full `data:image/...;base64,...` payload can remain in historical tool/message input and be replayed on every later request. A single screenshot can therefore turn a normal follow-up into a multi-megabyte request.
 
-The reducer sits between Codex and the provider. It preserves the image in the current user turn, but replaces repeated historical image content with a small textual marker before the request reaches the provider.
+The reducer sits between Codex and the provider. It preserves the image in the current user turn, but can replace repeated historical image content with a compact visual-memory summary before the request reaches the provider.
 
 ```text
 Codex CLI  ── POST /responses ──▶  localhost reducer  ── filtered POST /v1/responses ──▶  OpenAI-compatible provider
@@ -89,13 +89,15 @@ flowchart LR
 
 ## Lifecycle and state model
 
-The reducer has one in-memory `ImageLru` per running process. It stores metadata only:
+The reducer has one in-memory `ImageLru` per running process. By default it stores metadata only:
 
 ```text
 hash → { mediaType, byteCount, firstSeenAt }
 ```
 
 It never writes image bytes, prompts, authorization headers, or transcripts to disk. The default cache capacity is 2,048 hashes. When the capacity is exceeded, the least-recently-used metadata entry is removed.
+
+Use `--session-image-cache` to additionally retain original image bytes for the lifetime of the reducer process. Each image is encrypted in memory with AES-256-GCM using a fresh random key that also exists only in that process. No cache file, key file, or transcript is created. On a clean server shutdown cached buffers and the key are zeroed; on process termination the operating system releases the process memory. This cache is intentionally not sent back to the model automatically: historical requests continue to use the marker or visual-memory summary, and users must explicitly re-attach an image for fresh inspection.
 
 ```mermaid
 stateDiagram-v2
@@ -133,6 +135,22 @@ the reducer computes a SHA-256 digest over decoded image bytes. The first occurr
 ```
 
 This keeps the request schema valid while removing the large binary payload.
+
+### Visual-memory mode
+
+Start with `--visual-memory=summary` to preserve useful visual knowledge when historical images are reduced:
+
+```powershell
+node .\bin\image-reducer.mjs start `
+  --listen 127.0.0.1:8787 `
+  --upstream https://api.openai.com/v1 `
+  --visual-memory=summary `
+  --session-image-cache
+```
+
+For each image hash without a cached summary, the reducer makes one additional non-stored Responses request while the original image is available. The request asks the vision model to record readable text, numbers, layout, objects, relationships, controls, and uncertainty in at most 1,200 output tokens. The original image is still forwarded on the current turn. Later historical copies become an `input_text` item containing the hash metadata and that summary.
+
+The summary is held in the process-local LRU and is never written to disk by default. If summary generation fails, the original image is forwarded and the historical replacement falls back to the existing marker. A summary is necessarily lossy; exact inspection still requires re-attaching the image or using a provider-native image/file reference. The reducer cannot create such a reference generically because it is provider-specific.
 
 ## Image recognition and replacement
 
@@ -331,8 +349,8 @@ This product is a request-time reducer for Codex CLI custom Responses providers.
 - A transcript/session-file repair utility
 - A generic binary or PDF sanitizer
 - A provider-side token accounting system
+- A lossless visual memory system; summaries cannot guarantee answers about pixels they did not describe
 
 The central invariant is simple:
 
 > A newly supplied image remains available to the model; an unchanged historical image does not consume its full base64 payload on every subsequent request.
-

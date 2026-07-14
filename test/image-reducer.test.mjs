@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import test from "node:test";
-import { createImageReducerServer, ImageLru, imageMarker, parseDataImage, transformResponseBody } from "../bin/image-reducer.mjs";
+import { createImageReducerServer, ImageLru, imageMarker, parseDataImage, SessionImageCache, transformResponseBody } from "../bin/image-reducer.mjs";
 
 const png = "data:image/png;base64,aGVsbG8=";
 const pdf = "data:application/pdf;base64,aGVsbG8=";
@@ -69,6 +69,110 @@ test("bootstrap strips historical image data immediately", () => {
   ] }, { bootstrap: true });
   assert.match(result.body.input[0].content[0].image_url, /^\[image omitted/);
   assert.equal(result.metrics.imagesReplaced, 1);
+});
+
+test("session image cache encrypts images in memory and clears them", () => {
+  const image = parseDataImage(png);
+  const cache = new SessionImageCache();
+  cache.remember(image);
+  const encrypted = cache.entries.get(image.hash);
+  assert.notDeepEqual(encrypted.ciphertext, image.bytes);
+  const restored = cache.restore(image.hash);
+  assert.deepEqual(restored.bytes, image.bytes);
+  assert.equal(restored.mediaType, "image/png");
+  cache.clear();
+  assert.equal(cache.restore(image.hash), null);
+});
+
+test("session image cache is populated without changing historical reduction", () => {
+  const images = new ImageLru();
+  const cache = new SessionImageCache();
+  transformResponseBody({ input: [{ role: "user", content: [{ type: "input_image", image_url: png }] }] }, { images, imageCache: cache });
+  assert.deepEqual(cache.restore(parseDataImage(png).hash).bytes, Buffer.from("hello"));
+  const historical = transformResponseBody({ input: [
+    { role: "tool", content: [{ type: "input_image", image_url: png }] },
+    { role: "user", content: "next" }
+  ] }, { images, imageCache: cache });
+  assert.equal(historical.body.input[0].content[0].type, "input_text");
+  cache.clear();
+});
+
+test("visual memory summarizes once and replaces history with useful text", async (t) => {
+  const received = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    received.push(body);
+    if (received.length === 1) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: "Visible title: Revenue. Total: $42. The button is blue." }] }] }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end("data: ok\n\n");
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createImageReducerServer({ upstream: `http://127.0.0.1:${upstreamPort}`, visualMemory: true });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(upstream); });
+
+  const first = await request(proxyPort, "/responses", JSON.stringify({ model: "vision-test", input: [{ role: "user", content: [{ type: "input_image", image_url: png }] }] }));
+  assert.equal(first.status, 200);
+  assert.equal(received.length, 2);
+  assert.equal(received[1].input[0].content[0].image_url, png);
+
+  const second = await request(proxyPort, "/responses", JSON.stringify({ model: "vision-test", input: [
+    { role: "tool", content: [{ type: "input_image", image_url: png }] },
+    { role: "user", content: "What was the total?" }
+  ] }));
+  assert.equal(second.status, 200);
+  assert.equal(received.length, 3);
+  const replacement = received[2].input[0].content[0];
+  assert.equal(replacement.type, "input_text");
+  assert.match(replacement.text, /\[visual memory\]/);
+  assert.match(replacement.text, /Total: \$42/);
+});
+
+test("automatic reinspection restores only the image selected from visual memory", async (t) => {
+  const received = [];
+  const hash = parseDataImage(png).hash;
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    received.push(body);
+    const prompt = body.input?.[0]?.content?.[0]?.text ?? "";
+    if (prompt.includes("Create a compact visual memory")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ output: [{ content: [{ type: "output_text", text: "A dashboard with a title and a tiny status label." }] }] }));
+      return;
+    }
+    if (prompt.includes("Decide whether the latest user request")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ output: [{ content: [{ type: "output_text", text: JSON.stringify({ hashes: [hash] }) }] }] }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end("data: ok\n\n");
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createImageReducerServer({ upstream: `http://127.0.0.1:${upstreamPort}`, autoReinspect: true });
+  const proxyPort = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(upstream); });
+
+  await request(proxyPort, "/responses", JSON.stringify({ model: "vision-test", input: [{ role: "user", content: [{ type: "input_image", image_url: png }] }] }));
+  assert.equal(received.length, 2);
+
+  const second = await request(proxyPort, "/responses", JSON.stringify({ model: "vision-test", input: [
+    { role: "tool", content: [{ type: "input_image", image_url: png }] },
+    { role: "user", content: "What is the tiny status label?" }
+  ] }));
+  assert.equal(second.status, 200);
+  assert.equal(received.length, 4);
+  assert.match(received[2].input[0].content[0].text, /Visual memories/);
+  assert.equal(received[3].input[0].content[0].type, "input_image");
+  assert.equal(received[3].input[0].content[0].image_url, png);
 });
 
 test("proxy filters replayed history, preserves streamed responses, and rejects bypasses", async (t) => {
