@@ -97,7 +97,7 @@ hash → { mediaType, byteCount, firstSeenAt }
 
 It never writes image bytes, prompts, authorization headers, or transcripts to disk. The default cache capacity is 2,048 hashes. When the capacity is exceeded, the least-recently-used metadata entry is removed.
 
-Use `--session-image-cache` to additionally retain original image bytes for the lifetime of the reducer process. Each image is encrypted in memory with AES-256-GCM using a fresh random key that also exists only in that process. No cache file, key file, or transcript is created. On a clean server shutdown cached buffers and the key are zeroed; on process termination the operating system releases the process memory. This cache is intentionally not sent back to the model automatically: historical requests continue to use the marker or visual-memory summary, and users must explicitly re-attach an image for fresh inspection.
+Use `--session-image-cache` to additionally retain up to 64 recent original images for the lifetime of the reducer process. Each image is encrypted in memory with AES-256-GCM using a fresh random key that also exists only in that process. No cache file, key file, or transcript is created. On a clean server shutdown cached buffers and the key are zeroed; on process termination the operating system releases the process memory. Historical requests continue to use the marker or visual-memory summary unless `--auto-reinspect` is enabled.
 
 ```mermaid
 stateDiagram-v2
@@ -144,13 +144,18 @@ Start with `--visual-memory=summary` to preserve useful visual knowledge when hi
 node .\bin\image-reducer.mjs start `
   --listen 127.0.0.1:8787 `
   --upstream https://api.openai.com/v1 `
-  --visual-memory=summary `
-  --session-image-cache
+  --auto-reinspect
 ```
 
 For each image hash without a cached summary, the reducer makes one additional non-stored Responses request while the original image is available. The request asks the vision model to record readable text, numbers, layout, objects, relationships, controls, and uncertainty in at most 1,200 output tokens. The original image is still forwarded on the current turn. Later historical copies become an `input_text` item containing the hash metadata and that summary.
 
-The summary is held in the process-local LRU and is never written to disk by default. If summary generation fails, the original image is forwarded and the historical replacement falls back to the existing marker. A summary is necessarily lossy; exact inspection still requires re-attaching the image or using a provider-native image/file reference. The reducer cannot create such a reference generically because it is provider-specific.
+The summary is held in the process-local LRU and is never written to disk by default. If summary generation fails, the original image is forwarded and the historical replacement falls back to the existing marker.
+
+### Automatic reinspection
+
+`--auto-reinspect` enables visual-memory summaries and the encrypted session image cache automatically. When a later request contains a historical visual-memory item, the reducer makes one small non-streamed decision request containing the latest user text and the available summaries. If the model selects a hash because the summary lacks the needed detail, the reducer decrypts only that cached image and restores it in the normal upstream request. The normal request, including SSE streaming, is then passed through unchanged.
+
+This is intentionally conservative: the decision request may select no image, may select more than one image, and falls back to text-only visual memory if it fails or returns invalid JSON. It adds one provider request only when the current request contains a historical image with a summary. The reducer never writes the raw image or encryption key to disk.
 
 ## Image recognition and replacement
 

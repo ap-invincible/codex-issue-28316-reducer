@@ -5,12 +5,12 @@ description: Run, configure, verify, or stop the local Codex CLI image replay re
 
 # Image Replay Reducer
 
-Use this repository's `image-reducer` CLI as a localhost reverse proxy. It filters repeated `data:image/*;base64,...` history and never stores credentials. Image bytes are not retained by default; `--session-image-cache` enables encrypted, process-lifetime-only retention.
+Use this repository's `image-reducer` CLI as a localhost reverse proxy. It filters repeated `data:image/*;base64,...` history and never stores credentials. Image bytes are not retained by default; `--session-image-cache` enables encrypted, process-lifetime-only retention and `--auto-reinspect` restores only selected cached images automatically.
 
 ## Start
 
 1. Identify the existing Responses-compatible upstream base URL and its API-key environment variable. Do not print the key.
-2. Run `node ./bin/image-reducer.mjs start --listen 127.0.0.1:8787 --upstream <upstream-base-url>` from the repository root. Add `--session-image-cache` only when encrypted, memory-only retention for the reducer process is required.
+2. Run `node ./bin/image-reducer.mjs start --listen 127.0.0.1:8787 --upstream <upstream-base-url>` from the repository root. Add `--session-image-cache` for encrypted, memory-only retention, or `--auto-reinspect` to enable summaries, encrypted retention, and selective automatic reinspection together.
 3. Add this profile to `~/.codex/image-reducer.config.toml`, replacing the model and environment variable only when needed:
 
 ```toml

@@ -457,12 +457,12 @@ function forwardRequest(request, response, upstream, body, destinationOverride) 
   else request.pipe(upstreamRequest);
 }
 
-export function createImageReducerServer({ upstream, bootstrap = false, visualMemory = false, sessionImageCache = false, autoReinspect = false, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, cacheSize = 2048, onMetric = () => {} }) {
+export function createImageReducerServer({ upstream, bootstrap = false, visualMemory = false, sessionImageCache = false, autoReinspect = false, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, cacheSize = 2048, sessionCacheSize = 64, onMetric = () => {} }) {
   if (!upstream) fail("An upstream URL is required.");
   const upstreamUrl = new URL(upstream);
   if (!["http:", "https:"].includes(upstreamUrl.protocol)) fail("Upstream must use http or https.");
   const images = new ImageLru(cacheSize);
-  const imageCache = sessionImageCache || autoReinspect ? new SessionImageCache(cacheSize) : null;
+  const imageCache = sessionImageCache || autoReinspect ? new SessionImageCache(sessionCacheSize) : null;
   let requestNumber = 0;
   let bootstrapPending = bootstrap;
 
